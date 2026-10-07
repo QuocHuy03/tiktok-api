@@ -1,0 +1,25 @@
+# deps
+node_modules/
+__pycache__/
+*.pyc
+
+# secrets and sessions - never commit these
+.env
+keys.json
+*login*.txt
+*cookie*.txt
+
+# A real Chrome profile, ~65 MB, holding Network/Cookies and Login Data for
+# whatever account logged in. Committing it leaks the session.
+signer/.chrome-profile/
+
+# TikTok's own SDK bundles - not ours to redistribute.
+# Fetch them with: node signer/scripts/fetch-bundles.js
+signer/vendor/*.js
+
+# investigation leftovers and output
+signer/vendor/page-scripts.json
+signer/vendor/pumbaa-rule.decoded.json
+downloads/
+*.mp4
+out.json
