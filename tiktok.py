@@ -58,6 +58,12 @@ IMPERSONATE = "chrome131"
 SIGNER = "http://127.0.0.1:8081"
 TIMEOUT = 25
 HTTP_ATTEMPTS = 6
+API_ATTEMPTS = 3
+# Codes worth a second attempt. 203 is *mostly* term-specific rather than
+# transient - measured: "asmr" returns it on nearly every try while "dance"
+# never does, and resting 20s does not help - but it does succeed occasionally,
+# so a couple of retries are still worth the few hundred milliseconds.
+TRANSIENT_CODES = {203}
 
 SSR_RE = re.compile(
     r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">(.*?)</script>',
@@ -364,28 +370,57 @@ class TikTok:
         params = {**params, "referer": referer, "root_referer": referer}
         url = f"{HOST}{path}?{urlencode(params)}"
 
-        if signed:
-            signed_out = self._sign(url, cookie, referer)
-            url = signed_out["url"]
+        last = ""
+        for attempt in range(API_ATTEMPTS):
+            signed_url = url
+            if signed:
+                # Re-sign per attempt: the signature carries a timestamp.
+                signed_url = self._sign(url, cookie, referer)["url"]
+            try:
+                r = self._session(kind).get(
+                    signed_url, headers=api_headers(cookie, referer),
+                    impersonate=IMPERSONATE, timeout=TIMEOUT,
+                )
+            except Exception as e:
+                last = f"{type(e).__name__}: {e}"
+                time.sleep(0.6 * (attempt + 1))
+                continue
 
-        r = self._session(kind).get(
-            url, headers=api_headers(cookie, referer),
-            impersonate=IMPERSONATE, timeout=TIMEOUT,
-        )
-        body = r.text or ""
-        if not body.strip():
-            raise TikTokError(
-                f"{path}: empty body - gated to logged-in sessions "
-                "(a real browser gets nothing here as a guest either)"
-            )
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            raise TikTokError(f"{path}: non-JSON response")
-        code = data.get("statusCode", data.get("status_code", 0))
-        if code not in (0, None):
+            body = r.text or ""
+            if not body.strip():
+                # Not worth retrying: an empty body here is stable, and means
+                # either a gate or the wrong param set for this route.
+                # `comment/list` answers only to four params; `music/item_list`
+                # only to the full set. Fix the shape, not the attempt count.
+                raise TikTokError(
+                    f"{path}: empty body - this route rejected the request "
+                    "(gated, or the wrong param set for it)"
+                )
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                last = "non-JSON response"
+                time.sleep(0.6 * (attempt + 1))
+                continue
+
+            code = data.get("statusCode", data.get("status_code", 0))
+            if code in (0, None):
+                return data
+            if code in TRANSIENT_CODES:
+                last = f"tiktok statusCode={code}"
+                self.log(f"{path}: {last} - retrying")
+                time.sleep(0.8 * (attempt + 1))
+                continue
             raise TikTokError(f"{path}: tiktok statusCode={code}")
-        return data
+
+        if "203" in last and "search" in path:
+            raise TikTokError(
+                f"{path}: TikTok refused this search term (statusCode 203). "
+                "It is tied to the term, not to load - some words are "
+                "restricted while their phrases are not: 'asmr' fails, "
+                "'asmr eating' works."
+            )
+        raise TikTokError(f"{path}: {last} (after {API_ATTEMPTS} attempts)")
 
     # -- endpoints ---------------------------------------------------------- #
 
@@ -755,6 +790,73 @@ class TikTok:
                 last = f"empty body (HTTP {r.status_code})"
             time.sleep(0.5 * (attempt + 1))
         raise TikTokError(f"{path}: {last}")
+
+    def search(self, keyword: str, count: int = 12, pages: int = 1,
+               kind: str = "general") -> dict:
+        """Videos for a keyword.
+
+        `/api/search/item/full/` stays gated, but `general` and `photo` answer a
+        plain guest request - provided the whole param set is there. These
+        routes are the fussiest here: drop `search_source`,
+        `query_correct_type` or `web_search_code` and the body comes back empty,
+        which looks exactly like a gate. (`comment/list` is the opposite: it
+        only works with a *minimal* set. There is no shared template.)
+        """
+        path = {
+            "general": "/api/search/general/full/",
+            "photo": "/api/search/photo/full/",
+            "video": "/api/search/item/full/",
+        }[kind]
+        referer = f"{HOST}/search?q={quote(keyword)}"
+        videos: list[dict] = []
+        seen: set[str] = set()
+        cursor, has_more, search_id = 0, True, ""
+
+        for _ in range(max(1, pages)):
+            if not has_more:
+                break
+            extra = {"search_id": search_id} if search_id else {}
+            data = self.api(
+                path,
+                base_params(
+                    login_cookie=self.login,
+                    keyword=keyword,
+                    cursor=str(cursor),
+                    offset=str(cursor),
+                    count=str(count),
+                    from_page="search",
+                    search_source="normal_search",
+                    query_correct_type="1",
+                    is_non_personalized="false",
+                    web_search_code=(
+                        '{"tiktok":{"client_params_x":{"search_engine":'
+                        '{"ies_mt_user_live_video_card_use_libra":1}},"search_server":{}}}'
+                    ),
+                    **extra,
+                ),
+                referer,
+            )
+            # Page 2 onwards needs the id of the search it continues, and TikTok
+            # hides it in extra.logid. Without it the cursor is ignored and the
+            # next page simply repeats the first.
+            if not search_id:
+                search_id = (data.get("extra") or {}).get("logid") or ""
+
+            # general wraps each hit as {type, item}; photo returns item_list
+            entries = data.get("data") or data.get("item_list") or []
+            for entry in entries:
+                item = entry.get("item") if isinstance(entry, dict) and "item" in entry else entry
+                if not isinstance(item, dict) or not item.get("id") or item["id"] in seen:
+                    continue
+                seen.add(item["id"])
+                videos.append(norm_video(item))
+
+            has_more = bool(data.get("has_more"))
+            nxt = data.get("cursor")
+            cursor = int(nxt) if nxt else cursor + count
+
+        return {"keyword": keyword, "videos": videos,
+                "cursor": cursor, "has_more": has_more}
 
     def users(self, keyword: str, count: int = 10) -> list[dict]:
         """/api/search/user/full/ is gated; this suggestion route is not."""
